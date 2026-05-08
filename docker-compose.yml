@@ -1,0 +1,21 @@
+services:
+  dshare:
+    build: .
+    container_name: dshare
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      - dshare-data:/data
+    networks:
+      - default
+      - new-api_default
+
+volumes:
+  dshare-data:
+
+networks:
+  new-api_default:
+    external: true

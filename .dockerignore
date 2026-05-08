@@ -1,0 +1,9 @@
+.env
+.git
+backups
+data
+dshare.db*
+dshare_key_secret
+web/dist
+web/node_modules
+web/tsconfig.tsbuildinfo
