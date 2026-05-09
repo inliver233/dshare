@@ -29,11 +29,15 @@ export function OceanCanvas() {
       .then(({ OceanEngine }) => {
         if (disposed) return;
         const engine = new OceanEngine(canvas);
+        const state = useOceanState.getState();
+        engine.setTimeOfDay(state.timeOfDay);
+        engine.setWaveIntensity(state.waveIntensity);
         engineRef.current = engine;
         engine.start();
         setRenderFailed(false);
       })
       .catch((error) => {
+        if (disposed) return;
         console.error('Failed to initialize ocean renderer', error);
         setRenderFailed(true);
       });
