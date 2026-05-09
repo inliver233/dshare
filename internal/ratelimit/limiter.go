@@ -12,6 +12,14 @@ type Limiter struct {
 	lastPruned time.Time
 }
 
+type DenyReason string
+
+const (
+	DenyNone       DenyReason = ""
+	DenyConcurrent DenyReason = "concurrent"
+	DenyWindow     DenyReason = "window"
+)
+
 func New() *Limiter {
 	return &Limiter{
 		windows:  map[string][]time.Time{},
@@ -20,6 +28,11 @@ func New() *Limiter {
 }
 
 func (l *Limiter) Allow(userID int64, maxConcurrent int, rules ...Rule) (ReleaseFunc, bool, time.Duration) {
+	release, ok, retryAfter, _ := l.AllowDetailed(userID, maxConcurrent, rules...)
+	return release, ok, retryAfter
+}
+
+func (l *Limiter) AllowDetailed(userID int64, maxConcurrent int, rules ...Rule) (ReleaseFunc, bool, time.Duration, DenyReason) {
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -27,7 +40,7 @@ func (l *Limiter) Allow(userID int64, maxConcurrent int, rules ...Rule) (Release
 		l.pruneLocked(now)
 	}
 	if maxConcurrent > 0 && l.inflight[userID] >= maxConcurrent {
-		return nil, false, time.Second
+		return nil, false, time.Second, DenyConcurrent
 	}
 	var retryAfter time.Duration
 	for _, rule := range rules {
@@ -48,7 +61,7 @@ func (l *Limiter) Allow(userID int64, maxConcurrent int, rules ...Rule) (Release
 		}
 	}
 	if retryAfter > 0 {
-		return nil, false, retryAfter
+		return nil, false, retryAfter, DenyWindow
 	}
 	for _, rule := range rules {
 		if rule.Limit <= 0 || rule.Window <= 0 {
@@ -69,7 +82,7 @@ func (l *Limiter) Allow(userID int64, maxConcurrent int, rules ...Rule) (Release
 			}
 			l.mu.Unlock()
 		})
-	}, true, 0
+	}, true, 0, DenyNone
 }
 
 type ReleaseFunc func()

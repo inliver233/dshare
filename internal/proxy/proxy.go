@@ -90,7 +90,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctxUser, err := h.authenticate(r.Context(), r)
 	if err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "invalid dshare api key")
+		writeOpenAIError(w, http.StatusUnauthorized, "DShare API Key 无效或已被删除，请在 DShare 面板创建新的 dsh- 开头 Key")
 		return
 	}
 	if ctxUser.User.Role != "admin" && !isUnmeteredRequest(r) {
@@ -101,13 +101,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if ctxUser.User.RequestsPerDay > 0 && todayCount >= int64(ctxUser.User.RequestsPerDay) {
 			w.Header().Set("Retry-After", secondsUntilNextUTCDay())
-			writeOpenAIError(w, http.StatusTooManyRequests, "daily rate limit exceeded")
+			message := "已达到每日请求额度限制，请等待 UTC 零点重置或联系管理员提升额度"
+			writeOpenAIError(w, http.StatusTooManyRequests, message)
 			result := forwardResult{Status: http.StatusTooManyRequests, ErrorType: "daily_rate_limit", ErrorMessage: "daily rate limit exceeded"}
 			_ = h.recordRequest(context.Background(), r, ctxUser, result, start)
 			logProxyIssue(r, ctxUser, result, start)
 			return
 		}
-		release, ok, retryAfter := h.limiter.Allow(
+		release, ok, retryAfter, reason := h.limiter.AllowDetailed(
 			ctxUser.User.ID,
 			ctxUser.User.MaxConcurrentRequests,
 			ratelimit.Rule{Name: "minute", Limit: ctxUser.User.RequestsPerMinute, Window: time.Minute},
@@ -116,8 +117,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if retryAfter > 0 {
 				w.Header().Set("Retry-After", secondsCeil(retryAfter))
 			}
-			writeOpenAIError(w, http.StatusTooManyRequests, "rate limit exceeded")
-			result := forwardResult{Status: http.StatusTooManyRequests, ErrorType: "rate_limit", ErrorMessage: "rate limit exceeded"}
+			message := "已达到 Key 的 RPM 限制，请稍后重试或降低请求频率"
+			errorType := "rate_limit"
+			errorMessage := "rate limit exceeded"
+			if reason == ratelimit.DenyConcurrent {
+				message = "已达到 Key 的并发请求限制，请等待当前请求完成后再试"
+				errorType = "concurrent_limit"
+				errorMessage = "concurrent request limit exceeded"
+			}
+			writeOpenAIError(w, http.StatusTooManyRequests, message)
+			result := forwardResult{Status: http.StatusTooManyRequests, ErrorType: errorType, ErrorMessage: errorMessage}
 			_ = h.recordRequest(context.Background(), r, ctxUser, result, start)
 			logProxyIssue(r, ctxUser, result, start)
 			return
@@ -189,7 +198,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, ctxUser *Conte
 	}
 	cfg := h.config()
 	if cfg.NewAPIBaseURL == "" || cfg.NewAPIKey == "" {
-		writeOpenAIError(w, http.StatusBadGateway, "new-api upstream is not configured")
+		writeOpenAIError(w, http.StatusBadGateway, "new-api 上游未配置，请联系管理员检查 NEW_API_BASE_URL 和 NEW_API_KEY")
 		result.Status = http.StatusBadGateway
 		result.ErrorType = "config_error"
 		result.ErrorMessage = "new-api upstream is not configured"
@@ -197,7 +206,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, ctxUser *Conte
 	}
 	upstreamURL, err := url.Parse(cfg.NewAPIBaseURL)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "invalid new-api upstream url")
+		writeOpenAIError(w, http.StatusBadGateway, "new-api 上游地址无效，请联系管理员检查配置")
 		result.Status = http.StatusBadGateway
 		result.ErrorType = "config_error"
 		result.ErrorMessage = err.Error()
@@ -245,10 +254,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, ctxUser *Conte
 		if keepAlive != nil && keepAlive.wrote() {
 			result.Status = http.StatusOK
 			result.Stream = true
-			writeSSEError(w, "upstream request failed", true)
+			writeSSEError(w, "上游请求失败，请稍后重试；如果持续出现请联系管理员", true)
 			return result
 		}
-		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed")
+		writeOpenAIError(w, http.StatusBadGateway, "上游请求失败，请稍后重试；如果持续出现请联系管理员")
 		result.Status = http.StatusBadGateway
 		return result
 	}

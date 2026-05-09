@@ -113,6 +113,35 @@ type DashboardStats struct {
 	ActiveAPIKeys int64 `json:"active_api_keys"`
 }
 
+type RankQuery struct {
+	Board  string
+	Period string
+	Search string
+	Limit  int
+	Offset int
+	Now    time.Time
+}
+
+type RankItem struct {
+	Rank             int    `json:"rank"`
+	UserID           int64  `json:"user_id"`
+	DisplayName      string `json:"display_name"`
+	DiscordUsername  string `json:"discord_username"`
+	DiscordIDPreview string `json:"discord_id_preview"`
+	Value            int64  `json:"value"`
+}
+
+type RankResult struct {
+	Board       string     `json:"board"`
+	Period      string     `json:"period"`
+	Items       []RankItem `json:"items"`
+	Limit       int        `json:"limit"`
+	Offset      int        `json:"offset"`
+	NextOffset  int        `json:"next_offset,omitempty"`
+	HasMore     bool       `json:"has_more"`
+	GeneratedAt time.Time  `json:"generated_at"`
+}
+
 type ServiceConfig struct {
 	NewAPIBaseURL         string `json:"new_api_base_url"`
 	NewAPIKey             string `json:"new_api_key,omitempty"`
@@ -255,9 +284,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			request_id TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			validated_at TEXT
-		)`,
+			)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_contributions_valid_account ON contributions(account_hash) WHERE status = 'valid'`,
 		`CREATE INDEX IF NOT EXISTS idx_contributions_user ON contributions(user_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_contributions_status_created_user ON contributions(status, created_at DESC, user_id)`,
 		`CREATE TABLE IF NOT EXISTS request_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -283,9 +313,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			error_type TEXT NOT NULL DEFAULT '',
 			error_message TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL
-		)`,
+			)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_user_time ON request_logs(user_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_request_logs_created_user ON request_logs(created_at DESC, user_id)`,
+		`CREATE TABLE IF NOT EXISTS rank_counters (
+			metric TEXT NOT NULL,
+			period TEXT NOT NULL,
+			period_start TEXT NOT NULL,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			value INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (metric, period, period_start, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rank_counters_lookup ON rank_counters(metric, period, period_start, value DESC, user_id)`,
 		`CREATE TABLE IF NOT EXISTS service_settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL DEFAULT '',
@@ -304,6 +344,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureAPIKeyColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureRankCounters(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -382,6 +425,57 @@ func (s *Store) ensureColumns(ctx context.Context, table string, columns map[str
 		}
 	}
 	return nil
+}
+
+func (s *Store) ensureRankCounters(ctx context.Context) error {
+	var existing int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rank_counters`).Scan(&existing); err != nil {
+		return err
+	}
+	if existing > 0 {
+		return nil
+	}
+	stmts := []string{
+		`INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+			SELECT 'requests', 'all', '', user_id, COUNT(*)
+			FROM request_logs
+			GROUP BY user_id`,
+		`INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+			SELECT 'requests', 'day', substr(created_at, 1, 10), user_id, COUNT(*)
+			FROM request_logs
+			GROUP BY substr(created_at, 1, 10), user_id`,
+		`INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+			SELECT 'requests', 'week', date(substr(created_at, 1, 10), '-' || ((strftime('%w', substr(created_at, 1, 10)) + 6) % 7) || ' days'), user_id, COUNT(*)
+			FROM request_logs
+			GROUP BY date(substr(created_at, 1, 10), '-' || ((strftime('%w', substr(created_at, 1, 10)) + 6) % 7) || ' days'), user_id`,
+		`INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+			SELECT 'accepted_requests', 'day', substr(created_at, 1, 10), user_id, COUNT(*)
+			FROM request_logs
+			WHERE NOT (
+					status = 429 AND (
+						error_type IN ('rate_limit', 'daily_rate_limit', 'concurrent_limit') OR
+						error_message IN ('daily rate limit exceeded', 'rate limit exceeded', 'concurrent request limit exceeded')
+					)
+				)
+				AND NOT (method = 'GET' AND path IN ('/v1/models', '/v1beta/models'))
+			GROUP BY substr(created_at, 1, 10), user_id`,
+		`INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+			SELECT 'contributions', 'all', '', user_id, COUNT(*)
+			FROM contributions
+			WHERE status = 'valid'
+			GROUP BY user_id`,
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ServiceSettings(ctx context.Context) (map[string]string, error) {
@@ -618,11 +712,16 @@ func (s *Store) ListAPIKeys(ctx context.Context, userID int64) ([]APIKey, error)
 			COALESCE(k.last_used_at, ''), COALESCE(k.revoked_at, ''), k.key_ciphertext,
 			(SELECT COUNT(*) FROM request_logs rl WHERE rl.api_key_id = k.id),
 			(
-				SELECT COUNT(*) FROM request_logs rl
-				WHERE rl.api_key_id = k.id
-					AND rl.created_at >= ? AND rl.created_at < ?
-					AND NOT (rl.status = 429 AND rl.error_message IN ('daily rate limit exceeded', 'rate limit exceeded'))
-			)
+					SELECT COUNT(*) FROM request_logs rl
+					WHERE rl.api_key_id = k.id
+						AND rl.created_at >= ? AND rl.created_at < ?
+						AND NOT (
+							rl.status = 429 AND (
+								rl.error_type IN ('rate_limit', 'daily_rate_limit', 'concurrent_limit') OR
+								rl.error_message IN ('daily rate limit exceeded', 'rate limit exceeded', 'concurrent request limit exceeded')
+							)
+						)
+				)
 		FROM api_keys k
 		WHERE k.user_id = ? AND k.revoked_at IS NULL
 		ORDER BY k.created_at DESC
@@ -693,7 +792,11 @@ func (s *Store) GetAPIKeyUser(ctx context.Context, key string) (*User, *APIKey, 
 
 func (s *Store) RecordContribution(ctx context.Context, c Contribution) (bool, error) {
 	c = prepareContribution(c)
-	return insertContribution(ctx, s.db, c)
+	inserted, err := insertContribution(ctx, s.db, c)
+	if err != nil || !inserted || c.Status != "valid" {
+		return inserted, err
+	}
+	return inserted, addRankCount(ctx, s.db, "contributions", "all", "", c.UserID, 1)
 }
 
 func (s *Store) RecordContributionWithLimitBonus(ctx context.Context, c Contribution, rpmDelta, dailyDelta int) (bool, error) {
@@ -720,6 +823,11 @@ func (s *Store) RecordContributionWithLimitBonus(ctx context.Context, c Contribu
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return false, ErrNotFound
+		}
+	}
+	if inserted && c.Status == "valid" {
+		if err := addRankCount(ctx, tx, "contributions", "all", "", c.UserID, 1); err != nil {
+			return false, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -839,6 +947,9 @@ func (s *Store) MarkContributionDeletedWithLimitPenalty(ctx context.Context, use
 			return ErrNotFound
 		}
 	}
+	if err := addRankCount(ctx, tx, "contributions", "all", "", userID, -1); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -850,7 +961,12 @@ func (s *Store) RecordRequest(ctx context.Context, r RequestLog) error {
 	if r.Stream {
 		stream = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO request_logs (
 			user_id, api_key_id, method, path, query, upstream_path, status, upstream_status,
 			duration_ms, first_byte_ms, bytes_in, bytes_out, stream,
@@ -861,7 +977,18 @@ func (s *Store) RecordRequest(ctx context.Context, r RequestLog) error {
 		r.DurationMS, r.FirstByteMS, r.BytesIn, r.BytesOut, stream,
 		r.IP, r.UserAgent, r.Referer, r.RequestID, r.UpstreamRequestID,
 		r.RequestContentType, r.ResponseContentType, r.ErrorType, r.ErrorMessage, formatTime(r.CreatedAt))
-	return err
+	if err != nil {
+		return err
+	}
+	if err := addRequestRankCounts(ctx, tx, r.UserID, r.CreatedAt); err != nil {
+		return err
+	}
+	if isAcceptedDailyRequestLog(r) {
+		if err := addRankCount(ctx, tx, "accepted_requests", "day", dayPeriodStart(r.CreatedAt), r.UserID, 1); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CountRequestsSince(ctx context.Context, userID int64, since time.Time) (int64, error) {
@@ -887,13 +1014,8 @@ func (s *Store) UserStatsWithLimits(ctx context.Context, userID int64, dailyLimi
 	if err != nil {
 		return stats, err
 	}
-	start, end := todayUTCWindow()
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM request_logs
-		WHERE user_id = ? AND created_at >= ? AND created_at < ?
-			AND NOT (status = 429 AND error_message IN ('daily rate limit exceeded', 'rate limit exceeded'))
-			AND NOT (method = 'GET' AND path IN ('/v1/models', '/v1beta/models'))
-	`, userID, formatTime(start), formatTime(end)).Scan(&stats.RequestsToday); err != nil {
+	stats.RequestsToday, err = s.CountAcceptedRequestsToday(ctx, userID)
+	if err != nil {
 		return stats, err
 	}
 	if dailyLimit > 0 {
@@ -909,10 +1031,26 @@ func (s *Store) CountAcceptedRequestsToday(ctx context.Context, userID int64) (i
 	var count int64
 	start, end := todayUTCWindow()
 	err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM request_logs
-		WHERE user_id = ? AND created_at >= ? AND created_at < ?
-			AND NOT (status = 429 AND error_message IN ('daily rate limit exceeded', 'rate limit exceeded'))
-			AND NOT (method = 'GET' AND path IN ('/v1/models', '/v1beta/models'))
+		SELECT value
+		FROM rank_counters
+		WHERE metric = 'accepted_requests' AND period = 'day' AND period_start = ? AND user_id = ?
+	`, dayPeriodStart(start), userID).Scan(&count)
+	if err == nil {
+		return count, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	err = s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM request_logs
+			WHERE user_id = ? AND created_at >= ? AND created_at < ?
+				AND NOT (
+					status = 429 AND (
+						error_type IN ('rate_limit', 'daily_rate_limit', 'concurrent_limit') OR
+						error_message IN ('daily rate limit exceeded', 'rate limit exceeded', 'concurrent request limit exceeded')
+					)
+				)
+				AND NOT (method = 'GET' AND path IN ('/v1/models', '/v1beta/models'))
 	`, userID, formatTime(start), formatTime(end)).Scan(&count)
 	return count, err
 }
@@ -945,6 +1083,56 @@ func (s *Store) DashboardStats(ctx context.Context) (DashboardStats, error) {
 			(SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL)
 	`).Scan(&stats.Users, &stats.ValidUploads, &stats.TotalRequests, &stats.ActiveAPIKeys)
 	return stats, err
+}
+
+func (s *Store) PublicRank(ctx context.Context, q RankQuery) (RankResult, error) {
+	q = normalizeRankQuery(q)
+	result := RankResult{
+		Board:       q.Board,
+		Period:      q.Period,
+		Limit:       q.Limit,
+		Offset:      q.Offset,
+		GeneratedAt: nowOrUTC(q.Now),
+	}
+	periodStart := rankPeriodStart(q)
+	searchSQL, searchArgs := rankSearchSQL(q.Search)
+	args := []any{q.Board, q.Period, periodStart}
+	args = append(args, searchArgs...)
+	args = append(args, q.Limit+1, q.Offset)
+
+	query := buildRankSQL(searchSQL, q.Search != "")
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+
+	items := make([]RankItem, 0, q.Limit)
+	for rows.Next() {
+		var item RankItem
+		var discordID string
+		if err := rows.Scan(&item.UserID, &item.DisplayName, &item.DiscordUsername, &discordID, &item.Value); err != nil {
+			return result, err
+		}
+		if item.DisplayName == "" {
+			item.DisplayName = displayName(item.DiscordUsername, "", discordID)
+		}
+		item.DiscordIDPreview = maskDiscordID(discordID)
+		if len(items) < q.Limit {
+			item.Rank = q.Offset + len(items) + 1
+			items = append(items, item)
+		} else {
+			result.HasMore = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return result, err
+	}
+	result.Items = items
+	if result.HasMore {
+		result.NextOffset = q.Offset + len(items)
+	}
+	return result, nil
 }
 
 func userSelect() string {
@@ -1045,6 +1233,161 @@ func nullableTime(t time.Time) any {
 		return nil
 	}
 	return formatTime(t)
+}
+
+func normalizeRankQuery(q RankQuery) RankQuery {
+	q.Board = strings.ToLower(strings.TrimSpace(q.Board))
+	if q.Board != "contributions" {
+		q.Board = "requests"
+	}
+	q.Period = strings.ToLower(strings.TrimSpace(q.Period))
+	if q.Board == "contributions" {
+		q.Period = "all"
+	} else {
+		switch q.Period {
+		case "day", "week", "all":
+		default:
+			q.Period = "all"
+		}
+	}
+	q.Search = strings.TrimSpace(q.Search)
+	if len(q.Search) > 80 {
+		q.Search = q.Search[:80]
+	}
+	if q.Limit <= 0 {
+		q.Limit = 50
+	}
+	if q.Limit > 100 {
+		q.Limit = 100
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
+	return q
+}
+
+func buildRankSQL(searchSQL string, hasSearch bool) string {
+	where := ""
+	if hasSearch {
+		where = `AND ` + searchSQL
+	}
+	return `
+		SELECT
+			u.id,
+			COALESCE(NULLIF(u.discord_global_name, ''), NULLIF(u.discord_username, ''), u.discord_id) AS display_name,
+			u.discord_username,
+			u.discord_id,
+			rc.value
+		FROM rank_counters rc
+		JOIN users u ON u.id = rc.user_id
+		WHERE rc.metric = ? AND rc.period = ? AND rc.period_start = ? AND rc.value > 0
+		` + where + `
+		ORDER BY rc.value DESC, u.id ASC
+		LIMIT ? OFFSET ?`
+}
+
+func addRequestRankCounts(ctx context.Context, db execer, userID int64, createdAt time.Time) error {
+	createdAt = createdAt.UTC()
+	for _, item := range []struct {
+		period string
+		start  string
+	}{
+		{period: "all", start: ""},
+		{period: "day", start: dayPeriodStart(createdAt)},
+		{period: "week", start: weekPeriodStart(createdAt)},
+	} {
+		if err := addRankCount(ctx, db, "requests", item.period, item.start, userID, 1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isAcceptedDailyRequestLog(r RequestLog) bool {
+	if r.Method == "GET" && (r.Path == "/v1/models" || r.Path == "/v1beta/models") {
+		return false
+	}
+	if r.Status == 429 {
+		switch r.ErrorType {
+		case "rate_limit", "daily_rate_limit", "concurrent_limit":
+			return false
+		}
+		switch r.ErrorMessage {
+		case "daily rate limit exceeded", "rate limit exceeded", "concurrent request limit exceeded":
+			return false
+		}
+	}
+	return true
+}
+
+func addRankCount(ctx context.Context, db execer, metric, period, periodStart string, userID int64, delta int64) error {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO rank_counters (metric, period, period_start, user_id, value)
+		VALUES (?, ?, ?, ?, max(0, ?))
+		ON CONFLICT(metric, period, period_start, user_id) DO UPDATE SET
+			value = max(0, value + ?)
+	`, metric, period, periodStart, userID, delta, delta)
+	return err
+}
+
+func rankPeriodStart(q RankQuery) string {
+	if q.Board == "contributions" || q.Period == "all" {
+		return ""
+	}
+	now := nowOrUTC(q.Now)
+	if q.Period == "day" {
+		return dayPeriodStart(now)
+	}
+	return weekPeriodStart(now)
+}
+
+func dayPeriodStart(t time.Time) string {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+}
+
+func weekPeriodStart(t time.Time) string {
+	t = t.UTC()
+	weekday := int(t.Weekday())
+	if weekday == 0 {
+		weekday = 7
+	}
+	dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	return dayStart.AddDate(0, 0, -(weekday - 1)).Format("2006-01-02")
+}
+
+func rankSearchSQL(search string) (string, []any) {
+	search = strings.ToLower(strings.TrimSpace(search))
+	if search == "" {
+		return "", nil
+	}
+	like := "%" + search + "%"
+	return `(lower(u.discord_username) LIKE ? OR lower(u.discord_global_name) LIKE ? OR lower(u.discord_id) LIKE ?)`, []any{like, like, like}
+}
+
+func nowOrUTC(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t.UTC()
+}
+
+func displayName(username, globalName, discordID string) string {
+	if strings.TrimSpace(globalName) != "" {
+		return strings.TrimSpace(globalName)
+	}
+	if strings.TrimSpace(username) != "" {
+		return strings.TrimSpace(username)
+	}
+	return strings.TrimSpace(discordID)
+}
+
+func maskDiscordID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 6 {
+		return id
+	}
+	return id[:3] + "..." + id[len(id)-3:]
 }
 
 func parseTime(value string) (time.Time, error) {

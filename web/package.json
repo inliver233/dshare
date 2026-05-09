@@ -6,6 +6,8 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@mantine/core": "^7.17.8",
+    "@mantine/hooks": "^7.17.8",
     "@vitejs/plugin-react": "^5.0.4",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",

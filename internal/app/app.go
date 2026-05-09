@@ -89,6 +89,7 @@ func (a *App) Routes() http.Handler {
 
 	r.Route("/api", func(api chi.Router) {
 		api.Get("/config", a.handlePublicConfig)
+		api.Get("/rank", a.handlePublicRank)
 		api.Get("/auth/discord/start", a.handleDiscordStart)
 		api.Get("/auth/discord/callback", a.handleDiscordCallback)
 		api.Post("/auth/admin/login", a.handleAdminLogin)
@@ -129,6 +130,21 @@ func (a *App) handlePublicConfig(w http.ResponseWriter, _ *http.Request) {
 		"new_api_enabled": a.cfg.NewAPIBaseURL != "" && a.cfg.NewAPIKey != "",
 		"base_url":        a.cfg.AppBaseURL,
 	})
+}
+
+func (a *App) handlePublicRank(w http.ResponseWriter, r *http.Request) {
+	rank, err := a.store.PublicRank(r.Context(), store.RankQuery{
+		Board:  r.URL.Query().Get("board"),
+		Period: r.URL.Query().Get("period"),
+		Search: r.URL.Query().Get("q"),
+		Limit:  queryInt(r, "limit", 50),
+		Offset: queryInt(r, "offset", 0),
+	})
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "加载排行榜失败")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, rank)
 }
 
 func (a *App) handleDiscordStart(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +308,7 @@ func (a *App) handleDS2Import(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := parseAccountLines(req.Lines)
 	if len(entries) == 0 {
-		httpx.Error(w, http.StatusBadRequest, "未解析到任何有效账号，格式为 账号:密码 一行一个")
+		httpx.Error(w, http.StatusBadRequest, "未解析到任何有效账号，格式为 账号:密码 一行一个，中文冒号会自动兼容")
 		return
 	}
 	user := currentUser(r)
@@ -842,6 +858,7 @@ func parseAccountLines(lines string) []accountEntry {
 	seen := map[string]bool{}
 	for _, raw := range strings.Split(lines, "\n") {
 		line := strings.TrimSpace(raw)
+		line = strings.ReplaceAll(line, "：", ":")
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}

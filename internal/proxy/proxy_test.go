@@ -373,6 +373,75 @@ func TestUserStillUsesRateLimits(t *testing.T) {
 		if i == 1 && rec.Code != http.StatusTooManyRequests {
 			t.Fatalf("second user request status = %d, want 429", rec.Code)
 		}
+		if i == 1 && !bytes.Contains(rec.Body.Bytes(), []byte("RPM")) {
+			t.Fatalf("second user request body = %s", rec.Body.String())
+		}
+	}
+}
+
+func TestConcurrentLimitReturnsClearMessage(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(t.TempDir() + "/dshare.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	user, err := s.UpsertDiscordUser(ctx, "concurrent-user", "concurrent", "Concurrent", "", store.UserLimits{
+		RequestsPerMinute:     100,
+		RequestsPerDay:        2500,
+		MaxConcurrentRequests: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := s.CreateAPIKey(ctx, user.ID, "concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseUpstream
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	h := New(config.Config{NewAPIBaseURL: upstream.URL, NewAPIKey: "upstream-key"}, s, ratelimit.New())
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	firstReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReq.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		resp, err := server.Client().Do(firstReq)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	secondReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReq.Header.Set("Authorization", "Bearer "+key.PlaintextKey)
+	resp, err := server.Client().Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	close(releaseUpstream)
+	<-firstDone
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, string(body))
+	}
+	if !bytes.Contains(body, []byte("并发")) {
+		t.Fatalf("body = %s", string(body))
 	}
 }
 
