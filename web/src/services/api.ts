@@ -5,9 +5,21 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   })
   const text = await res.text()
-  const data = text ? JSON.parse(text) : null
+  let data: unknown = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = text
+    }
+  }
   if (!res.ok) {
-    throw new Error(data?.error?.message || data?.message || `HTTP ${res.status}`)
+    const message = typeof data === 'object' && data !== null
+      ? (data as { error?: { message?: string }; message?: string }).error?.message || (data as { message?: string }).message
+      : typeof data === 'string' && data.trim()
+        ? data
+        : ''
+    throw new Error(message || `HTTP ${res.status}`)
   }
   return data as T
 }

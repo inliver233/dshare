@@ -1,11 +1,20 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { MeResponse, PublicConfig } from './types/api'
 import { api } from './services/api'
-import { AppShell } from './layout/AppShell'
 import { LoadingScreen } from './components/Feedback'
-import { AdminLogin, Forbidden, PublicLogin } from './pages/LoginPages'
-import { AdminSections, DashboardPage } from './pages/DashboardPage'
-import { RankPage } from './pages/RankPage'
+
+const AppShell = lazy(() => import('./layout/AppShell').then((module) => ({ default: module.AppShell })))
+const PublicLogin = lazy(() => import('./pages/LoginPages').then((module) => ({ default: module.PublicLogin })))
+const AdminLogin = lazy(() => import('./pages/LoginPages').then((module) => ({ default: module.AdminLogin })))
+const Forbidden = lazy(() => import('./pages/LoginPages').then((module) => ({ default: module.Forbidden })))
+const DashboardPage = lazy(() => import('./pages/DashboardPage').then((module) => ({ default: module.DashboardPage })))
+const AdminSections = lazy(() => import('./pages/DashboardPage').then((module) => ({ default: module.AdminSections })))
+const RankPage = lazy(() => import('./pages/RankPage').then((module) => ({ default: module.RankPage })))
+
+function LazyBoundary({ children }: { children: ReactNode }) {
+  return <Suspense fallback={<LoadingScreen />}>{children}</Suspense>
+}
 
 export function App() {
   const [config, setConfig] = useState<PublicConfig | null>(null)
@@ -39,20 +48,36 @@ export function App() {
     setMe(null)
   }
 
-  if (isRankPath) return <RankPage />
+  if (isRankPath) {
+    return (
+      <LazyBoundary>
+        <RankPage />
+      </LazyBoundary>
+    )
+  }
   if (loading) return <LoadingScreen />
   if (!me) {
-    return isAdminPath
-      ? <AdminLogin onLogin={refresh} message={message} />
-      : <PublicLogin config={config} message={message} />
+    return (
+      <LazyBoundary>
+        {isAdminPath
+          ? <AdminLogin onLogin={refresh} message={message} />
+          : <PublicLogin config={config} message={message} />}
+      </LazyBoundary>
+    )
   }
   if (isAdminPath && me.user.role !== 'admin') {
-    return <Forbidden onLogout={logout} />
+    return (
+      <LazyBoundary>
+        <Forbidden onLogout={logout} />
+      </LazyBoundary>
+    )
   }
 
   return (
-    <AppShell user={me.user} config={config} isAdminPath={isAdminPath} proxyBaseURL={me.proxy_base_url} onLogout={logout}>
-      {isAdminPath ? <AdminSections /> : <DashboardPage me={me} onChanged={refresh} />}
-    </AppShell>
+    <LazyBoundary>
+      <AppShell user={me.user} config={config} isAdminPath={isAdminPath} proxyBaseURL={me.proxy_base_url} onLogout={logout}>
+        {isAdminPath ? <AdminSections /> : <DashboardPage me={me} onChanged={refresh} />}
+      </AppShell>
+    </LazyBoundary>
   )
 }

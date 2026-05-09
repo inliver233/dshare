@@ -1,5 +1,6 @@
 import { AppShell as MantineAppShell, Avatar, Badge, Box, Button, Code, Group, NavLink, Stack, Text, Title } from '@mantine/core'
 import { KeyRound, LogOut, Settings, Shield, Trophy } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
 import type { ReactNode } from 'react'
 import type { PublicConfig, User } from '../types/api'
 import { displayName } from '../utils/format'
@@ -31,7 +32,6 @@ export function AppShell({ user, config, isAdminPath, proxyBaseURL, onLogout, ch
               <Box className="brandMark"><Shield /></Box>
               <Box>
                 <Text fw={700} c="var(--color-text-title)">DShare</Text>
-                <Text size="xs" c="var(--color-text-muted)">Oceanic relay console</Text>
               </Box>
             </Group>
           </Box>
@@ -45,16 +45,22 @@ export function AppShell({ user, config, isAdminPath, proxyBaseURL, onLogout, ch
           </Group>
 
           <Stack gap={4} className="navList">
-            {navItems.map(({ href, label, icon: Icon, active }) => (
-              <NavLink
+            {navItems.map(({ href, label, icon: Icon, active }, i) => (
+              <motion.div
                 key={href}
-                href={href}
-                active={active}
-                label={label}
-                leftSection={<Icon size={18} />}
-                variant="light"
-                className="navItem"
-              />
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.1 + i * 0.05, type: 'spring', stiffness: 300, damping: 30 }}
+              >
+                <NavLink
+                  href={href}
+                  active={active}
+                  label={label}
+                  leftSection={<Icon size={18} />}
+                  variant="light"
+                  className="navItem"
+                />
+              </motion.div>
             ))}
           </Stack>
 
@@ -68,18 +74,31 @@ export function AppShell({ user, config, isAdminPath, proxyBaseURL, onLogout, ch
         <Box className="mainContainer">
           <header className="pageHeader">
             <Box>
-              <Title order={1}>{isAdminPath ? '管理员' : '账号'}</Title>
+              <Group gap="md" align="center">
+                <Title order={1}>{isAdminPath ? '管理员' : '账号'}</Title>
+                <Group gap="xs" className="statusBadges">
+                  <Badge bg="rgba(13, 148, 136, 0.1)" c="#0D9488" radius={99} size="sm" style={{ fontWeight: 800 }}>new-api</Badge>
+                  <Badge bg="rgba(13, 148, 136, 0.1)" c="#0D9488" radius={99} size="sm" style={{ fontWeight: 800 }}>ds2api</Badge>
+                </Group>
+              </Group>
               <Group gap="xs" mt={8} className="proxyLine">
                 <Text size="xs" c="var(--color-text-muted)">代理地址</Text>
                 <Code className="codeText">{baseURL}</Code>
               </Group>
             </Box>
-            <Group gap="xs" className="statusBadges">
-              <Badge color={config?.new_api_enabled ? 'green' : 'red'} variant="light">new-api</Badge>
-              <Badge color={config?.ds2api_enabled ? 'green' : 'red'} variant="light">ds2api</Badge>
-            </Group>
           </header>
-          {children}
+          
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={isAdminPath ? 'admin' : 'dashboard'}
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -15 }}
+              transition={{ type: 'spring', stiffness: 400, damping: 40 }}
+            >
+              {children}
+            </motion.div>
+          </AnimatePresence>
         </Box>
       </MantineAppShell.Main>
     </MantineAppShell>
