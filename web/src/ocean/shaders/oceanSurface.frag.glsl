@@ -19,6 +19,7 @@ uniform float uTime;
 uniform sampler2D uNormalMap;
 uniform samplerCube uEnvMap;
 uniform float uEnvMapReady;
+uniform float uEnvBlend;
 
 float fresnelSchlick(float cosTheta, float f0) {
   return f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
@@ -73,7 +74,8 @@ void main() {
   vec3 reflectDir = reflect(-V, N);
   vec3 reflection = getFallbackSkyColor(reflectDir);
   if (uEnvMapReady > 0.5) {
-    reflection = textureCube(uEnvMap, reflectDir).rgb;
+    vec3 envReflection = textureCube(uEnvMap, reflectDir).rgb;
+    reflection = mix(reflection, envReflection, uEnvBlend);
   }
   reflection = mix(reflection, reflection * uSunColor, 0.4);
 
@@ -82,7 +84,7 @@ void main() {
   vec3 baseColor = mix(uShallowColor, uDeepColor, depthFactor);
 
   float fresnel = fresnelSchlick(NdotV, 0.02);
-  vec3 color = mix(baseColor, reflection, fresnel);
+  vec3 color = mix(baseColor, reflection, fresnel * 0.82);
 
   float specular = pow(NdotH, 350.0);
   color += uSunColor * specular * 1.5 * fresnel * uSunIntensity;

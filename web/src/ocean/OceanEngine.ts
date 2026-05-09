@@ -14,7 +14,63 @@ type OceanTransitionColors = {
   shallow: THREE.Color;
   foam: THREE.Color;
   sun: THREE.Color;
+  skyZenith: THREE.Color;
+  skyHorizon: THREE.Color;
+  skyLower: THREE.Color;
+  starIntensity: number;
+  envBlend: number;
+  sunIntensity: number;
 };
+
+const SKY_VERT = `
+varying vec3 vWorldDir;
+
+void main() {
+  vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+  vWorldDir = normalize(worldPosition.xyz - cameraPosition);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const SKY_FRAG = `
+precision highp float;
+
+varying vec3 vWorldDir;
+
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform vec3 uSkyLower;
+uniform float uStarIntensity;
+uniform float uTime;
+
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+void main() {
+  vec3 dir = normalize(vWorldDir);
+  float y = dir.y;
+  float horizon = 1.0 - smoothstep(0.0, 0.48, abs(y));
+
+  vec3 upper = mix(uSkyHorizon, uSkyZenith, smoothstep(0.0, 0.92, y));
+  vec3 lower = mix(uSkyLower, uSkyHorizon, smoothstep(-0.34, 0.08, y));
+  vec3 color = mix(lower, upper, smoothstep(-0.02, 0.12, y));
+  color += uSkyHorizon * horizon * 0.32;
+
+  vec2 starUv = dir.xz / max(0.18, y + 1.15) * 90.0;
+  vec2 cell = floor(starUv);
+  vec2 local = fract(starUv) - 0.5;
+  float starSeed = hash(cell);
+  float starCore = smoothstep(0.055, 0.0, length(local));
+  float twinkle = 0.65 + 0.35 * sin(uTime * 0.8 + starSeed * 37.0);
+  float star = step(0.992, starSeed) * starCore * twinkle * smoothstep(0.04, 0.42, y);
+  color += vec3(0.68, 0.82, 1.0) * star * uStarIntensity;
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
 
 export class OceanEngine {
   canvas: HTMLCanvasElement;
@@ -28,6 +84,8 @@ export class OceanEngine {
 
   oceanMaterial!: THREE.ShaderMaterial;
   oceanMesh!: THREE.Mesh;
+  skyMaterial!: THREE.ShaderMaterial;
+  skyMesh!: THREE.Mesh;
   
   targetTimeOfDay: TimeStateKey = 'day';
   currentTimeOfDay: TimeStateKey = 'day';
@@ -70,9 +128,10 @@ export class OceanEngine {
     this.scene = new THREE.Scene();
     const { width, height } = this.getViewportSize();
     this.camera = new THREE.PerspectiveCamera(55, width / height, 0.5, 1000);
-    this.camera.position.set(0, 15, 30);
-    this.camera.lookAt(0, 0, 0);
+    this.camera.position.set(0, 14, 34);
+    this.camera.lookAt(0, 2.5, 0);
 
+    this.initSky();
     this.initOcean();
     this.resizeRenderer();
 
@@ -97,14 +156,13 @@ export class OceanEngine {
     const amplitudes = WAVE_LAYERS.map(w => w.A);
     const speeds = WAVE_LAYERS.map(w => w.speed);
 
-    const ts = TIME_STATES[this.currentTimeOfDay].palette;
     const initialColors = this.paletteColors(this.currentTimeOfDay);
     this.transitionFromColors = this.clonePaletteColors(initialColors);
     this.transitionToColors = this.clonePaletteColors(initialColors);
 
     this.normalMap = this.createFallbackNormalMap();
     this.fallbackEnvMap = this.createFallbackEnvMap();
-    this.scene.background = new THREE.Color(ts.deep);
+    this.scene.background = null;
 
     this.oceanMaterial = new THREE.ShaderMaterial({
       vertexShader: waveVert,
@@ -123,7 +181,7 @@ export class OceanEngine {
         uCameraPos: { value: this.camera.position },
         uSunDirection: { value: new THREE.Vector3(1, 1, 1).normalize() },
         uSunColor: { value: initialColors.sun },
-        uSunIntensity: { value: 1.0 },
+        uSunIntensity: { value: initialColors.sunIntensity },
         uDeepColor: { value: initialColors.deep },
         uShallowColor: { value: initialColors.shallow },
         uFoamColor: { value: initialColors.foam },
@@ -131,6 +189,7 @@ export class OceanEngine {
         uNormalMap: { value: this.normalMap },
         uEnvMap: { value: this.fallbackEnvMap },
         uEnvMapReady: { value: 0.0 },
+        uEnvBlend: { value: initialColors.envBlend },
       }
     });
 
@@ -139,6 +198,30 @@ export class OceanEngine {
 
     this.loadNormalMap();
     this.loadEnvMap();
+  }
+
+  private initSky() {
+    const colors = this.paletteColors(this.currentTimeOfDay);
+
+    this.skyMaterial = new THREE.ShaderMaterial({
+      vertexShader: SKY_VERT,
+      fragmentShader: SKY_FRAG,
+      depthWrite: false,
+      depthTest: false,
+      side: THREE.BackSide,
+      uniforms: {
+        uSkyZenith: { value: colors.skyZenith },
+        uSkyHorizon: { value: colors.skyHorizon },
+        uSkyLower: { value: colors.skyLower },
+        uStarIntensity: { value: colors.starIntensity },
+        uTime: { value: 0 },
+      },
+    });
+
+    this.skyMesh = new THREE.Mesh(new THREE.SphereGeometry(700, 48, 24), this.skyMaterial);
+    this.skyMesh.frustumCulled = false;
+    this.skyMesh.renderOrder = -100;
+    this.scene.add(this.skyMesh);
   }
 
   private createFallbackNormalMap() {
@@ -203,7 +286,6 @@ export class OceanEngine {
         }
         this.envMap?.dispose();
         this.envMap = texture;
-        this.scene.background = texture;
         this.oceanMaterial.uniforms.uEnvMap.value = texture;
         this.oceanMaterial.uniforms.uEnvMapReady.value = 1.0;
         this.fallbackEnvMap?.dispose();
@@ -213,7 +295,6 @@ export class OceanEngine {
       undefined,
       () => {
         if (this.isDisposed) return;
-        this.scene.background = new THREE.Color(TIME_STATES[this.currentTimeOfDay].palette.deep);
         this.oceanMaterial.uniforms.uEnvMap.value = this.fallbackEnvMap;
         this.oceanMaterial.uniforms.uEnvMapReady.value = 0.0;
       },
@@ -242,11 +323,60 @@ export class OceanEngine {
 
   private paletteColors(tod: TimeStateKey): OceanTransitionColors {
     const palette = TIME_STATES[tod].palette;
+    const skyByTime: Record<TimeStateKey, {
+      zenith: string;
+      horizon: string;
+      lower: string;
+      starIntensity: number;
+      envBlend: number;
+      sunIntensity: number;
+    }> = {
+      dawn: {
+        zenith: '#123B62',
+        horizon: '#F08A4B',
+        lower: '#075C68',
+        starIntensity: 0.08,
+        envBlend: 0.22,
+        sunIntensity: 1.15,
+      },
+      day: {
+        zenith: '#51B5E6',
+        horizon: '#C8F4FF',
+        lower: '#0877A6',
+        starIntensity: 0.0,
+        envBlend: 0.12,
+        sunIntensity: 1.35,
+      },
+      dusk: {
+        zenith: '#25154F',
+        horizon: '#F35B75',
+        lower: '#24185F',
+        starIntensity: 0.16,
+        envBlend: 0.28,
+        sunIntensity: 1.05,
+      },
+      night: {
+        zenith: '#020617',
+        horizon: '#14315F',
+        lower: '#00162B',
+        starIntensity: 0.72,
+        envBlend: 0.45,
+        sunIntensity: 0.68,
+      },
+    };
+    const sky = skyByTime[tod];
+
     return {
       deep: new THREE.Color(palette.deep),
       shallow: new THREE.Color(palette.shallow),
       foam: new THREE.Color(palette.foam),
       sun: new THREE.Color(palette.sun),
+      skyZenith: new THREE.Color(sky.zenith),
+      skyHorizon: new THREE.Color(sky.horizon),
+      skyLower: new THREE.Color(sky.lower),
+      starIntensity: sky.starIntensity,
+      envBlend: sky.envBlend,
+      sunIntensity: sky.sunIntensity,
     };
   }
 
@@ -256,32 +386,46 @@ export class OceanEngine {
       shallow: colors.shallow.clone(),
       foam: colors.foam.clone(),
       sun: colors.sun.clone(),
+      skyZenith: colors.skyZenith.clone(),
+      skyHorizon: colors.skyHorizon.clone(),
+      skyLower: colors.skyLower.clone(),
+      starIntensity: colors.starIntensity,
+      envBlend: colors.envBlend,
+      sunIntensity: colors.sunIntensity,
     };
   }
 
   private currentUniformColors(): OceanTransitionColors {
     const uniforms = this.oceanMaterial.uniforms;
+    const skyUniforms = this.skyMaterial.uniforms;
     return {
       deep: (uniforms.uDeepColor.value as THREE.Color).clone(),
       shallow: (uniforms.uShallowColor.value as THREE.Color).clone(),
       foam: (uniforms.uFoamColor.value as THREE.Color).clone(),
       sun: (uniforms.uSunColor.value as THREE.Color).clone(),
+      skyZenith: (skyUniforms.uSkyZenith.value as THREE.Color).clone(),
+      skyHorizon: (skyUniforms.uSkyHorizon.value as THREE.Color).clone(),
+      skyLower: (skyUniforms.uSkyLower.value as THREE.Color).clone(),
+      starIntensity: Number(skyUniforms.uStarIntensity.value),
+      envBlend: Number(uniforms.uEnvBlend.value),
+      sunIntensity: Number(uniforms.uSunIntensity.value),
     };
   }
 
   private applyTransitionColors(t: number) {
     const uniforms = this.oceanMaterial.uniforms;
+    const skyUniforms = this.skyMaterial.uniforms;
     (uniforms.uDeepColor.value as THREE.Color).copy(this.transitionFromColors.deep).lerp(this.transitionToColors.deep, t);
     (uniforms.uShallowColor.value as THREE.Color).copy(this.transitionFromColors.shallow).lerp(this.transitionToColors.shallow, t);
     (uniforms.uFoamColor.value as THREE.Color).copy(this.transitionFromColors.foam).lerp(this.transitionToColors.foam, t);
     (uniforms.uSunColor.value as THREE.Color).copy(this.transitionFromColors.sun).lerp(this.transitionToColors.sun, t);
+    uniforms.uEnvBlend.value = THREE.MathUtils.lerp(this.transitionFromColors.envBlend, this.transitionToColors.envBlend, t);
+    uniforms.uSunIntensity.value = THREE.MathUtils.lerp(this.transitionFromColors.sunIntensity, this.transitionToColors.sunIntensity, t);
 
-    if (!this.envMap) {
-      if (!(this.scene.background instanceof THREE.Color)) {
-        this.scene.background = new THREE.Color();
-      }
-      this.scene.background.copy(this.transitionFromColors.deep).lerp(this.transitionToColors.deep, t);
-    }
+    (skyUniforms.uSkyZenith.value as THREE.Color).copy(this.transitionFromColors.skyZenith).lerp(this.transitionToColors.skyZenith, t);
+    (skyUniforms.uSkyHorizon.value as THREE.Color).copy(this.transitionFromColors.skyHorizon).lerp(this.transitionToColors.skyHorizon, t);
+    (skyUniforms.uSkyLower.value as THREE.Color).copy(this.transitionFromColors.skyLower).lerp(this.transitionToColors.skyLower, t);
+    skyUniforms.uStarIntensity.value = THREE.MathUtils.lerp(this.transitionFromColors.starIntensity, this.transitionToColors.starIntensity, t);
   }
 
   onResize = () => {
@@ -344,11 +488,12 @@ export class OceanEngine {
     this.oceanMaterial.uniforms.uTime.value = time;
     this.oceanMaterial.uniforms.uWaveIntensity.value = this.waveIntensity;
     this.oceanMaterial.uniforms.uCameraPos.value.copy(this.camera.position);
+    this.skyMaterial.uniforms.uTime.value = time;
 
     // 动态相机的微弱漂移，增加沉浸感
-    this.camera.position.y = 15 + Math.sin(time * 0.5) * 1.5;
-    this.camera.position.x = Math.cos(time * 0.2) * 2.0;
-    this.camera.lookAt(0, 0, 0);
+    this.camera.position.y = 14 + Math.sin(time * 0.5) * 1.1;
+    this.camera.position.x = Math.cos(time * 0.2) * 1.6;
+    this.camera.lookAt(0, 2.8, 0);
 
     this.renderer.render(this.scene, this.camera);
     this.rafId = requestAnimationFrame(() => this.loop());
